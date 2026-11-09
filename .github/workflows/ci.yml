@@ -1,0 +1,184 @@
+# Place this file at .github/workflows/ci.yml in your GitHub public repo.
+#
+# Required GitHub Secrets (repo → Settings → Secrets → Actions):
+#   GITLAB_ACCESS_TOKEN  – GitLab token to clone kasir-pintar/kiosk-android (read_repository scope)
+#   KEYSTORE_BASE64      – base64-encoded kiosk-key-store.jks
+#   API_BASE_URL         – Backend base URL (https://.../)
+#   FIREBASE_APP_ID      – Firebase App ID (1:xxxx:android:xxxx)
+#   FIREBASE_TOKEN       – Firebase CLI token (`firebase login:ci`)
+#   GITLAB_API_TOKEN     – GitLab token with `api` scope (to create GitLab Release)
+
+name: Kiosk Android CI/CD
+
+on:
+  push:
+    tags:
+      - 'debug-*'
+      - '[0-9]*'   # catches x.y.z+a tags; exact format validated in setup job
+
+jobs:
+
+  # ── Detect env from tag ──────────────────────────────────────────────────────
+
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      env: ${{ steps.detect.outputs.env }}
+      version_name: ${{ steps.detect.outputs.version_name }}
+      version_code: ${{ steps.detect.outputs.version_code }}
+    steps:
+      - id: detect
+        run: |
+          TAG="${{ github.ref_name }}"
+          if [[ "$TAG" =~ ^debug- ]]; then
+            echo "env=debug" >> $GITHUB_OUTPUT
+          elif [[ "$TAG" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\+([0-9]+)$ ]]; then
+            echo "env=release"                       >> $GITHUB_OUTPUT
+            echo "version_name=${BASH_REMATCH[1]}"  >> $GITHUB_OUTPUT
+            echo "version_code=${BASH_REMATCH[2]}"  >> $GITHUB_OUTPUT
+          else
+            echo "env=unknown" >> $GITHUB_OUTPUT
+          fi
+
+  # ── Test ─────────────────────────────────────────────────────────────────────
+
+  test:
+    needs: setup
+    if: needs.setup.outputs.env != 'unknown'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout from GitLab
+        run: |
+          git clone --depth 1 --branch ${{ github.ref_name }} \
+            https://oauth2:${{ secrets.GITLAB_ACCESS_TOKEN }}@gitlab.kpntr.com/kasir-pintar/kiosk-android.git .
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Run unit tests
+        run: ./gradlew test -PAPI_BASE_URL="${{ secrets.API_BASE_URL }}"
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: app/build/reports/tests/
+          retention-days: 7
+
+  # ── Build debug APK ───────────────────────────────────────────────────────────
+
+  build-debug:
+    needs: [setup, test]
+    if: needs.setup.outputs.env == 'debug'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout from GitLab
+        run: |
+          git clone --depth 1 --branch ${{ github.ref_name }} \
+            https://oauth2:${{ secrets.GITLAB_ACCESS_TOKEN }}@gitlab.kpntr.com/kasir-pintar/kiosk-android.git .
+
+      - name: Restore keystore
+        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > kiosk-key-store.jks
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug -PAPI_BASE_URL="${{ secrets.API_BASE_URL }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 7
+
+  # ── Build release AAB ─────────────────────────────────────────────────────────
+
+  build-release:
+    needs: [setup, test]
+    if: needs.setup.outputs.env == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout from GitLab
+        run: |
+          git clone --depth 1 --branch ${{ github.ref_name }} \
+            https://oauth2:${{ secrets.GITLAB_ACCESS_TOKEN }}@gitlab.kpntr.com/kasir-pintar/kiosk-android.git .
+
+      - name: Restore keystore
+        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > kiosk-key-store.jks
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build release AAB
+        run: |
+          ./gradlew bundleRelease \
+            -PAPI_BASE_URL="${{ secrets.API_BASE_URL }}" \
+            -PversionName="${{ needs.setup.outputs.version_name }}" \
+            -PversionCode="${{ needs.setup.outputs.version_code }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-release
+          path: app/build/outputs/bundle/release/app-release.aab
+          retention-days: 30
+
+  # ── Deploy: Firebase App Distribution (debug) ─────────────────────────────────
+
+  deploy-firebase:
+    needs: [setup, build-debug]
+    if: needs.setup.outputs.env == 'debug'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-debug
+
+      - uses: wzieba/Firebase-Distribution-Github-Action@v1
+        with:
+          appId: ${{ secrets.FIREBASE_APP_ID }}
+          token: ${{ secrets.FIREBASE_TOKEN }}
+          groups: testers
+          file: app-debug.apk
+          releaseNotes: "Build from tag ${{ github.ref_name }}"
+
+  # ── Deploy: GitLab Release (release) ─────────────────────────────────────────
+
+  deploy-gitlab-release:
+    needs: [setup, build-release]
+    if: needs.setup.outputs.env == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-release
+
+      - name: Create GitLab Release
+        env:
+          VERSION_NAME: ${{ needs.setup.outputs.version_name }}
+          VERSION_CODE: ${{ needs.setup.outputs.version_code }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "PRIVATE-TOKEN: ${{ secrets.GITLAB_API_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --data "{
+              \"name\": \"v${VERSION_NAME} (${VERSION_CODE})\",
+              \"tag_name\": \"${TAG}\",
+              \"description\": \"Release ${VERSION_NAME} (build ${VERSION_CODE})\"
+            }" \
+            "https://gitlab.kpntr.com/api/v4/projects/kasir-pintar%2Fkiosk-android/releases"
