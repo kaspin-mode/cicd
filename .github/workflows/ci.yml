@@ -61,7 +61,12 @@ jobs:
       - uses: gradle/actions/setup-gradle@v6
 
       - name: Run unit tests
-        run: ./gradlew test -PAPI_BASE_URL="${{ secrets.API_BASE_URL }}"
+        run: |
+          EXTRA_ARGS=()
+          if [ -n "${{ secrets.API_BASE_URL }}" ]; then
+            EXTRA_ARGS+=("-PAPI_BASE_URL=${{ secrets.API_BASE_URL }}")
+          fi
+          ./gradlew test "${EXTRA_ARGS[@]}"
 
       - name: Upload test reports
         if: always()
@@ -94,7 +99,12 @@ jobs:
       - uses: gradle/actions/setup-gradle@v6
 
       - name: Build debug APK
-        run: ./gradlew assembleDebug -PAPI_BASE_URL="${{ secrets.API_BASE_URL }}"
+        run: |
+          EXTRA_ARGS=()
+          if [ -n "${{ secrets.API_BASE_URL }}" ]; then
+            EXTRA_ARGS+=("-PAPI_BASE_URL=${{ secrets.API_BASE_URL }}")
+          fi
+          ./gradlew assembleDebug "${EXTRA_ARGS[@]}"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -126,8 +136,12 @@ jobs:
 
       - name: Build release AAB
         run: |
+          EXTRA_ARGS=()
+          if [ -n "${{ secrets.API_BASE_URL }}" ]; then
+            EXTRA_ARGS+=("-PAPI_BASE_URL=${{ secrets.API_BASE_URL }}")
+          fi
           ./gradlew bundleRelease \
-            -PAPI_BASE_URL="${{ secrets.API_BASE_URL }}" \
+            "${EXTRA_ARGS[@]}" \
             -PversionName="${{ needs.setup.outputs.version_name }}" \
             -PversionCode="${{ needs.setup.outputs.version_code }}"
 
