@@ -166,7 +166,7 @@ jobs:
         with:
           appId: ${{ secrets.FIREBASE_APP_ID }}
           token: ${{ secrets.FIREBASE_TOKEN }}
-          groups: testers
+          groups: Tech
           file: app-debug.apk
           releaseNotes: "Build from tag ${{ github.ref_name }}"
 
