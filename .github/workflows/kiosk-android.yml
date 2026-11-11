@@ -1,0 +1,227 @@
+# GitHub Actions workflow for kiosk-android.
+# Triggered by GitLab CI via repository_dispatch (event_type: kiosk-android).
+#
+# Environment: kiosk-android
+#   Environment Secrets (Settings -> Environments -> kiosk-android -> Environment secrets):
+#     KEYSTORE_BASE64      - base64-encoded kiosk-key-store.jks
+#     API_BASE_URL         - Backend base URL (https://.../)
+#     FIREBASE_APP_ID      - Firebase App ID (1:xxxx:android:xxxx)
+#
+#   Repository Secrets (Settings -> Secrets and variables -> Actions -> Repository secrets):
+#     GITLAB_ACCESS_TOKEN  - GitLab token to clone kasir-pintar/kiosk-android (read_repository scope)
+#     FIREBASE_TOKEN       - Firebase CLI token (`firebase login:ci`)
+#     GITLAB_API_TOKEN     - GitLab token with `api` scope (to create GitLab Release)
+
+name: Kiosk Android CI/CD
+
+on:
+  repository_dispatch:
+    types: [kiosk-android]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'GitLab tag (e.g. debug-20261110.1300 or 1.0.0+1)'
+        required: true
+
+jobs:
+
+  # ── Detect env from tag ──────────────────────────────────────────────────────
+
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.detect.outputs.tag }}
+      env: ${{ steps.detect.outputs.env }}
+      version_name: ${{ steps.detect.outputs.version_name }}
+      version_code: ${{ steps.detect.outputs.version_code }}
+    steps:
+      - id: detect
+        run: |
+          TAG="${{ github.event.client_payload.tag || inputs.tag }}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          if [[ "$TAG" =~ ^debug- ]]; then
+            echo "env=debug" >> $GITHUB_OUTPUT
+          elif [[ "$TAG" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\+([0-9]+)$ ]]; then
+            echo "env=release"                       >> $GITHUB_OUTPUT
+            echo "version_name=${BASH_REMATCH[1]}"  >> $GITHUB_OUTPUT
+            echo "version_code=${BASH_REMATCH[2]}"  >> $GITHUB_OUTPUT
+          else
+            echo "env=unknown" >> $GITHUB_OUTPUT
+          fi
+
+  # ── Test ─────────────────────────────────────────────────────────────────────
+
+  test:
+    needs: setup
+    if: needs.setup.outputs.env != 'unknown'
+    runs-on: ubuntu-latest
+    environment: kiosk-android
+    steps:
+      - name: Checkout from GitLab
+        run: |
+          git clone --depth 1 --branch ${{ needs.setup.outputs.tag }} \
+            https://oauth2:${{ secrets.GITLAB_ACCESS_TOKEN }}@${{ secrets.GITLAB_BASE_URL }}/${{ secrets.GITLAB_ORG }}/kiosk-android.git .
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Run unit tests
+        run: |
+          EXTRA_ARGS=()
+          if [ -n "${{ secrets.API_BASE_URL }}" ]; then
+            EXTRA_ARGS+=("-PAPI_BASE_URL=${{ secrets.API_BASE_URL }}")
+          fi
+          ./gradlew test "${EXTRA_ARGS[@]}"
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: app/build/reports/tests/
+          retention-days: 7
+
+      - name: Upload reports to GitLab Generic Packages
+        if: always()
+        run: |
+          if [ ! -d app/build/reports/tests ]; then
+            echo "No test reports found; skipping GitLab package upload."
+            exit 0
+          fi
+          TAG="${{ needs.setup.outputs.tag }}"
+          zip -r test-reports.zip app/build/reports/tests/
+          curl --fail-with-body --silent --show-error \
+            --request PUT \
+            --header "PRIVATE-TOKEN: ${{ secrets.GITLAB_API_TOKEN }}" \
+            --upload-file test-reports.zip \
+            "https://${{ secrets.GITLAB_BASE_URL }}/api/v4/projects/${{ secrets.GITLAB_ORG }}%2Fkiosk-android/packages/generic/test-reports/${TAG}/test-reports.zip"
+
+  # ── Build debug APK ───────────────────────────────────────────────────────────
+
+  build-debug:
+    needs: [setup, test]
+    if: needs.setup.outputs.env == 'debug'
+    runs-on: ubuntu-latest
+    environment: kiosk-android
+    steps:
+      - name: Checkout from GitLab
+        run: |
+          git clone --depth 1 --branch ${{ needs.setup.outputs.tag }} \
+            https://oauth2:${{ secrets.GITLAB_ACCESS_TOKEN }}@${{ secrets.GITLAB_BASE_URL }}/${{ secrets.GITLAB_ORG }}/kiosk-android.git .
+
+      - name: Restore keystore
+        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > kiosk-key-store.jks
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Build debug APK
+        run: |
+          EXTRA_ARGS=()
+          if [ -n "${{ secrets.API_BASE_URL }}" ]; then
+            EXTRA_ARGS+=("-PAPI_BASE_URL=${{ secrets.API_BASE_URL }}")
+          fi
+          ./gradlew assembleDebug "${EXTRA_ARGS[@]}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 7
+
+  # ── Build release AAB ─────────────────────────────────────────────────────────
+
+  build-release:
+    needs: [setup, test]
+    if: needs.setup.outputs.env == 'release'
+    runs-on: ubuntu-latest
+    environment: kiosk-android
+    steps:
+      - name: Checkout from GitLab
+        run: |
+          git clone --depth 1 --branch ${{ needs.setup.outputs.tag }} \
+            https://oauth2:${{ secrets.GITLAB_ACCESS_TOKEN }}@${{ secrets.GITLAB_BASE_URL }}/${{ secrets.GITLAB_ORG }}/kiosk-android.git .
+
+      - name: Restore keystore
+        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > kiosk-key-store.jks
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Build release AAB
+        run: |
+          EXTRA_ARGS=()
+          if [ -n "${{ secrets.API_BASE_URL }}" ]; then
+            EXTRA_ARGS+=("-PAPI_BASE_URL=${{ secrets.API_BASE_URL }}")
+          fi
+          ./gradlew bundleRelease \
+            "${EXTRA_ARGS[@]}" \
+            -PversionName="${{ needs.setup.outputs.version_name }}" \
+            -PversionCode="${{ needs.setup.outputs.version_code }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-release
+          path: app/build/outputs/bundle/release/app-release.aab
+          retention-days: 30
+
+  # ── Deploy: Firebase App Distribution (debug) ─────────────────────────────────
+
+  deploy-firebase:
+    needs: [setup, build-debug]
+    if: needs.setup.outputs.env == 'debug'
+    runs-on: ubuntu-latest
+    environment: kiosk-android
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-debug
+
+      - uses: wzieba/Firebase-Distribution-Github-Action@v1
+        with:
+          appId: ${{ secrets.FIREBASE_APP_ID }}
+          token: ${{ secrets.FIREBASE_TOKEN }}
+          groups: Tech
+          file: app-debug.apk
+          releaseNotes: "Build from tag ${{ needs.setup.outputs.tag }}"
+
+  # ── Deploy: GitLab Release (release) ─────────────────────────────────────────
+
+  deploy-gitlab-release:
+    needs: [setup, build-release]
+    if: needs.setup.outputs.env == 'release'
+    runs-on: ubuntu-latest
+    environment: kiosk-android
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-release
+
+      - name: Create GitLab Release
+        env:
+          VERSION_NAME: ${{ needs.setup.outputs.version_name }}
+          VERSION_CODE: ${{ needs.setup.outputs.version_code }}
+          TAG: ${{ needs.setup.outputs.tag }}
+        run: |
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "PRIVATE-TOKEN: ${{ secrets.GITLAB_API_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --data "{
+              \"name\": \"v${VERSION_NAME} (${VERSION_CODE})\",
+              \"tag_name\": \"${TAG}\",
+              \"description\": \"Release ${VERSION_NAME} (build ${VERSION_CODE})\"
+            }" \
+            "https://${{ secrets.GITLAB_BASE_URL }}/api/v4/projects/${{ secrets.GITLAB_ORG }}%2Fkiosk-android/releases"
