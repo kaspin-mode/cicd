@@ -387,7 +387,7 @@ jobs:
   build-windows-debug:
     needs: [setup, test]
     if: needs.setup.outputs.platform == 'windows' && needs.setup.outputs.env == 'debug'
-    runs-on: windows-2019
+    runs-on: windows-latest
     environment: kasirpintar-dashboard
     steps:
       - name: Checkout from GitLab
@@ -405,6 +405,27 @@ jobs:
 
       - name: Flutter pub get
         run: flutter pub get --no-example
+
+      - name: Create cmake wrapper (VS 16→17 shim)
+        shell: pwsh
+        run: |
+          # Flutter 3.24.5 hardcodes "-G Visual Studio 16 2019"; shim rewrites to 17 2022
+          $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vsWhere -latest -requires Microsoft.Component.MSBuild -property installationPath
+          $realCmake = Join-Path $vsPath "Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+          if (-not (Test-Path $realCmake)) { $realCmake = (Get-Command cmake).Source }
+          Write-Host "Real cmake: $realCmake"
+          $wrapperDir = Join-Path $env:RUNNER_TEMP "cmake_wrapper"
+          New-Item -ItemType Directory -Force -Path $wrapperDir | Out-Null
+          @"
+@echo off
+setlocal EnableDelayedExpansion
+set "allargs=%*"
+set "allargs=!allargs:Visual Studio 16 2019=Visual Studio 17 2022!"
+"$realCmake" !allargs!
+"@ | Set-Content -Path "$wrapperDir\cmake.cmd" -Encoding ascii
+          "$wrapperDir" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          Write-Host "cmake wrapper installed at $wrapperDir"
 
       - name: Restore PFX certificate
         shell: pwsh
@@ -778,7 +799,7 @@ jobs:
   build-windows-release:
     needs: [setup, test]
     if: needs.setup.outputs.platform == 'windows' && needs.setup.outputs.env == 'release'
-    runs-on: windows-2019
+    runs-on: windows-latest
     environment: kasirpintar-dashboard
     steps:
       - name: Checkout from GitLab
@@ -796,6 +817,27 @@ jobs:
 
       - name: Flutter pub get
         run: flutter pub get --no-example
+
+      - name: Create cmake wrapper (VS 16→17 shim)
+        shell: pwsh
+        run: |
+          # Flutter 3.24.5 hardcodes "-G Visual Studio 16 2019"; shim rewrites to 17 2022
+          $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vsWhere -latest -requires Microsoft.Component.MSBuild -property installationPath
+          $realCmake = Join-Path $vsPath "Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+          if (-not (Test-Path $realCmake)) { $realCmake = (Get-Command cmake).Source }
+          Write-Host "Real cmake: $realCmake"
+          $wrapperDir = Join-Path $env:RUNNER_TEMP "cmake_wrapper"
+          New-Item -ItemType Directory -Force -Path $wrapperDir | Out-Null
+          @"
+@echo off
+setlocal EnableDelayedExpansion
+set "allargs=%*"
+set "allargs=!allargs:Visual Studio 16 2019=Visual Studio 17 2022!"
+"$realCmake" !allargs!
+"@ | Set-Content -Path "$wrapperDir\cmake.cmd" -Encoding ascii
+          "$wrapperDir" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          Write-Host "cmake wrapper installed at $wrapperDir"
 
       - name: Restore PFX certificate
         shell: pwsh
