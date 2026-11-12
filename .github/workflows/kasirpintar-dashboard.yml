@@ -1,0 +1,728 @@
+# GitHub Actions workflow for kasirpintar-dashboard (Flutter).
+# Triggered by GitLab CI via repository_dispatch (event_type: kasirpintar-dashboard).
+#
+# Environment: kasirpintar-dashboard
+#   Environment Secrets (Settings → Environments → kasirpintar-dashboard → Environment secrets):
+#     APPSTORE_API_KEY_ID       - App Store Connect API Key ID            (e.g. F9X6J9N6A7)
+#     APPSTORE_API_ISSUER_ID    - App Store Connect Issuer ID             (e.g. 63db2cae-4ad9-...)
+#     APPSTORE_API_KEY_P8_BASE64 - base64-encoded AuthKey_<ID>.p8 file   (`base64 -i AuthKey_xxx.p8 | pbcopy`)
+#     WINDOWS_CERT_PFX_BASE64   - base64-encoded kaspin.pfx              (`base64 -i kaspin.pfx | pbcopy`)
+#     WINDOWS_CERT_PASSWORD     - PFX certificate password
+#     FIREBASE_IOS_APP_ID       - Firebase App ID for iOS                 (1:xxxx:ios:xxxx)
+#     FIREBASE_MACOS_APP_ID     - Firebase App ID for macOS               (1:xxxx:osx:xxxx)
+#     RELEASE_GITLAB_TOKEN      - GitLab PAT with api scope on gitlab.kpntr.com (for windows-release project)
+#     GITLAB_BASE_URL           - e.g. gitlab.kpntr.com
+#     GITLAB_ORG                - e.g. kasir-pintar
+#
+#   Repository Secrets (Settings → Secrets and variables → Actions → Repository secrets):
+#     GITLAB_ACCESS_TOKEN  - GitLab token to clone kasirpintar_dashboard (read_repository scope)
+#     GITLAB_API_TOKEN     - GitLab token with api scope
+#     FIREBASE_TOKEN       - Firebase CLI token (`firebase login:ci`)
+
+name: KasirPintar Dashboard CI/CD
+
+on:
+  repository_dispatch:
+    types: [kasirpintar-dashboard]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >
+          GitLab tag — e.g.
+          debug-macos-20261110.1300 | debug-ios-20261110.1300 | debug-windows-20261110.1300 |
+          macos-1.2.3+45 | ios-1.2.3+45 | windows-1.2.3+45
+        required: true
+
+jobs:
+
+  # ── Detect platform, env, and version from tag ───────────────────────────────
+
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      tag:          ${{ steps.detect.outputs.tag }}
+      platform:     ${{ steps.detect.outputs.platform }}
+      env:          ${{ steps.detect.outputs.env }}
+      version_name: ${{ steps.detect.outputs.version_name }}
+      version_code: ${{ steps.detect.outputs.version_code }}
+    steps:
+      - id: detect
+        run: |
+          TAG="${{ github.event.client_payload.tag || inputs.tag }}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+
+          # Tag patterns:
+          #   debug-macos-*    → platform=macos,  env=debug
+          #   debug-ios-*      → platform=ios,    env=debug
+          #   debug-windows-*  → platform=windows, env=debug
+          #   macos-X.Y.Z+N   → platform=macos,  env=release
+          #   ios-X.Y.Z+N     → platform=ios,    env=release
+          #   windows-X.Y.Z+N → platform=windows, env=release
+
+          if   [[ "$TAG" =~ ^debug-macos- ]];   then PLATFORM=macos;   ENV=debug
+          elif [[ "$TAG" =~ ^debug-ios- ]];     then PLATFORM=ios;     ENV=debug
+          elif [[ "$TAG" =~ ^debug-windows- ]]; then PLATFORM=windows; ENV=debug
+          elif [[ "$TAG" =~ ^macos-([0-9]+\.[0-9]+\.[0-9]+)\+([0-9]+)$ ]]; then
+            PLATFORM=macos; ENV=release
+            echo "version_name=${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
+            echo "version_code=${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
+          elif [[ "$TAG" =~ ^ios-([0-9]+\.[0-9]+\.[0-9]+)\+([0-9]+)$ ]]; then
+            PLATFORM=ios; ENV=release
+            echo "version_name=${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
+            echo "version_code=${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
+          elif [[ "$TAG" =~ ^windows-([0-9]+\.[0-9]+\.[0-9]+)\+([0-9]+)$ ]]; then
+            PLATFORM=windows; ENV=release
+            echo "version_name=${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
+            echo "version_code=${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
+          else
+            PLATFORM=unknown; ENV=unknown
+          fi
+
+          echo "platform=${PLATFORM}" >> $GITHUB_OUTPUT
+          echo "env=${ENV}"           >> $GITHUB_OUTPUT
+
+  # ── Test (flutter test) — runs for all valid tags ────────────────────────────
+  # macOS runner needed for iOS/macOS because flutter iOS build requires Xcode.
+  # For Windows we also need a mac runner to run dart tool/coverage.dart (cross-platform).
+  # shortcut: test runs on macos-latest for all platforms; a dedicated linux runner
+  #           could be used for windows/non-apple tests to cut cost, when runners are added.
+
+  test:
+    needs: setup
+    if: needs.setup.outputs.env != 'unknown'
+    runs-on: macos-latest
+    environment: kasirpintar-dashboard
+    steps:
+      - name: Checkout from GitLab
+        run: |
+          git clone --depth 1 --branch ${{ needs.setup.outputs.tag }} \
+            https://oauth2:${{ secrets.GITLAB_ACCESS_TOKEN }}@${{ secrets.GITLAB_BASE_URL }}/${{ secrets.GITLAB_ORG }}/kasirpintar_dashboard.git .
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get --no-example
+
+      - name: Run unit tests with coverage
+        run: |
+          flutter test \
+            test/unit/ \
+            --coverage \
+            --reporter expanded \
+            --no-pub
+
+      - name: Generate HTML coverage report
+        run: dart tool/coverage.dart
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage/lcov.info
+            coverage/html/
+          retention-days: 30
+
+      - name: Upload coverage to GitLab Generic Packages
+        if: always()
+        run: |
+          TAG="${{ needs.setup.outputs.tag }}"
+          zip -r coverage-report.zip coverage/
+          curl --fail-with-body --silent --show-error \
+            --request PUT \
+            --header "PRIVATE-TOKEN: ${{ secrets.GITLAB_API_TOKEN }}" \
+            --upload-file coverage-report.zip \
+            "https://${{ secrets.GITLAB_BASE_URL }}/api/v4/projects/${{ secrets.GITLAB_ORG }}%2Fkasirpintar_dashboard/packages/generic/coverage/${TAG}/coverage-report.zip"
+
+  # ── Build: macOS debug artifact ───────────────────────────────────────────────
+
+  build-macos-debug:
+    needs: [setup, test]
+    if: needs.setup.outputs.platform == 'macos' && needs.setup.outputs.env == 'debug'
+    runs-on: macos-latest
+    environment: kasirpintar-dashboard
+    steps:
+      - name: Checkout from GitLab
+        run: |
+          git clone --depth 1 --branch ${{ needs.setup.outputs.tag }} \
+            https://oauth2:${{ secrets.GITLAB_ACCESS_TOKEN }}@${{ secrets.GITLAB_BASE_URL }}/${{ secrets.GITLAB_ORG }}/kasirpintar_dashboard.git .
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get --no-example
+
+      - name: Restore App Store Connect API key
+        run: |
+          KEY_ID="${{ secrets.APPSTORE_API_KEY_ID }}"
+          KEY_PATH="$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8"
+          mkdir -p "$(dirname $KEY_PATH)"
+          echo "${{ secrets.APPSTORE_API_KEY_P8_BASE64 }}" | base64 -d > "$KEY_PATH"
+
+      - name: Build macOS debug artifact
+        run: flutter build macos --debug
+
+      - name: Upload macOS debug artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-debug
+          path: build/macos/Build/Products/Debug/
+          retention-days: 7
+
+  # ── Deploy: macOS debug → Firebase App Distribution ──────────────────────────
+
+  deploy-macos-debug-firebase:
+    needs: [setup, build-macos-debug]
+    if: needs.setup.outputs.platform == 'macos' && needs.setup.outputs.env == 'debug'
+    runs-on: ubuntu-latest
+    environment: kasirpintar-dashboard
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-debug
+          path: macos-debug/
+
+      - name: Zip macOS debug artifact for Firebase upload
+        run: |
+          cd macos-debug
+          zip -r ../kasirpintar-dashboard-macos-debug.zip .
+
+      - uses: wzieba/Firebase-Distribution-Github-Action@v1
+        with:
+          appId: ${{ secrets.FIREBASE_MACOS_APP_ID }}
+          token: ${{ secrets.FIREBASE_TOKEN }}
+          groups: Tech
+          file: kasirpintar-dashboard-macos-debug.zip
+          releaseNotes: "Build from tag ${{ needs.setup.outputs.tag }}"
+
+  # ── Build: iOS debug IPA (ad-hoc) ────────────────────────────────────────────
+
+  build-ios-debug:
+    needs: [setup, test]
+    if: needs.setup.outputs.platform == 'ios' && needs.setup.outputs.env == 'debug'
+    runs-on: macos-latest
+    environment: kasirpintar-dashboard
+    steps:
+      - name: Checkout from GitLab
+        run: |
+          git clone --depth 1 --branch ${{ needs.setup.outputs.tag }} \
+            https://oauth2:${{ secrets.GITLAB_ACCESS_TOKEN }}@${{ secrets.GITLAB_BASE_URL }}/${{ secrets.GITLAB_ORG }}/kasirpintar_dashboard.git .
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get --no-example
+
+      - name: Restore App Store Connect API key
+        run: |
+          KEY_ID="${{ secrets.APPSTORE_API_KEY_ID }}"
+          KEY_PATH="$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8"
+          mkdir -p "$(dirname $KEY_PATH)"
+          echo "${{ secrets.APPSTORE_API_KEY_P8_BASE64 }}" | base64 -d > "$KEY_PATH"
+
+      - name: Install CocoaPods dependencies
+        run: |
+          cd ios && pod install --repo-update
+
+      - name: Archive iOS (debug / ad-hoc)
+        run: |
+          KEY_ID="${{ secrets.APPSTORE_API_KEY_ID }}"
+          KEY_PATH="$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8"
+          flutter build ios --config-only --release
+          xcodebuild archive \
+            -workspace ios/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath build/ios/archive/Runner.xcarchive \
+            -quiet \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY_PATH" \
+            -authenticationKeyID "$KEY_ID" \
+            -authenticationKeyIssuerID "${{ secrets.APPSTORE_API_ISSUER_ID }}"
+
+      - name: Export iOS IPA (ad-hoc)
+        run: |
+          KEY_ID="${{ secrets.APPSTORE_API_KEY_ID }}"
+          KEY_PATH="$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8"
+          xcodebuild -exportArchive \
+            -archivePath build/ios/archive/Runner.xcarchive \
+            -exportPath build/ios/ipa \
+            -exportOptionsPlist ExportOptions-ios-adhoc.plist \
+            -quiet \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY_PATH" \
+            -authenticationKeyID "$KEY_ID" \
+            -authenticationKeyIssuerID "${{ secrets.APPSTORE_API_ISSUER_ID }}"
+
+      - name: Upload iOS debug IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-debug-ipa
+          path: build/ios/ipa/*.ipa
+          retention-days: 7
+
+  # ── Deploy: iOS debug IPA → Firebase App Distribution ────────────────────────
+
+  deploy-ios-debug-firebase:
+    needs: [setup, build-ios-debug]
+    if: needs.setup.outputs.platform == 'ios' && needs.setup.outputs.env == 'debug'
+    runs-on: ubuntu-latest
+    environment: kasirpintar-dashboard
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-debug-ipa
+
+      - uses: wzieba/Firebase-Distribution-Github-Action@v1
+        with:
+          appId: ${{ secrets.FIREBASE_IOS_APP_ID }}
+          token: ${{ secrets.FIREBASE_TOKEN }}
+          groups: Tech
+          file: Runner.ipa
+          releaseNotes: "Build from tag ${{ needs.setup.outputs.tag }}"
+
+  # ── Build: Windows debug MSIX ─────────────────────────────────────────────────
+  # shortcut: uses windows-latest (GitHub-hosted), not the self-hosted Windows Runner.
+  #           Switch to self-hosted if the MSIX signing cert chain requires it.
+
+  build-windows-debug:
+    needs: [setup, test]
+    if: needs.setup.outputs.platform == 'windows' && needs.setup.outputs.env == 'debug'
+    runs-on: windows-latest
+    environment: kasirpintar-dashboard
+    steps:
+      - name: Checkout from GitLab
+        shell: bash
+        run: |
+          git clone --depth 1 --branch ${{ needs.setup.outputs.tag }} \
+            https://oauth2:${{ secrets.GITLAB_ACCESS_TOKEN }}@${{ secrets.GITLAB_BASE_URL }}/${{ secrets.GITLAB_ORG }}/kasirpintar_dashboard.git .
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get --no-example
+
+      - name: Restore PFX certificate
+        shell: pwsh
+        run: |
+          $bytes = [Convert]::FromBase64String("${{ secrets.WINDOWS_CERT_PFX_BASE64 }}")
+          [IO.File]::WriteAllBytes("$env:USERPROFILE\kaspin.pfx", $bytes)
+
+      - name: Build Windows debug MSIX
+        shell: pwsh
+        run: |
+          flutter build windows --debug
+          flutter pub run msix:create `
+            --store `
+            --certificate-path "$env:USERPROFILE\kaspin.pfx" `
+            --certificate-password "${{ secrets.WINDOWS_CERT_PASSWORD }}" `
+            --logo-path "assets/images/logo_app.png" `
+            --publisher-display-name "PT KASIR PINTAR INTERNASIONAL" `
+            --publisher "CN=CB035A2C-7F6B-46A1-8042-42B86FFE7F03" `
+            --app-uri-handler-hosts kpntr.link `
+            --protocol-activation https,kaspindashboard
+
+      - name: Upload Windows debug MSIX
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-debug-msix
+          path: build/**/*.msix
+          retention-days: 7
+
+  # ── Deploy: Windows debug MSIX → Personal GitLab Release ─────────────────────
+
+  deploy-windows-debug-release:
+    needs: [setup, build-windows-debug]
+    if: needs.setup.outputs.platform == 'windows' && needs.setup.outputs.env == 'debug'
+    runs-on: ubuntu-latest
+    environment: kasirpintar-dashboard
+    env:
+      TAG:        ${{ needs.setup.outputs.tag }}
+      RELEASE_TAG: kp-dashboard-${{ needs.setup.outputs.tag }}
+      PROJECT_ID: "157"
+      BASE_URL:   https://gitlab.kpntr.com/api/v4/projects/157
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-debug-msix
+          path: msix-out/
+
+      - name: Create GitLab tag + Release and upload MSIX
+        run: |
+          HEADERS=(-H "PRIVATE-TOKEN: ${{ secrets.RELEASE_GITLAB_TOKEN }}" -H "Content-Type: application/json")
+
+          # 1. Create tag in alan/windows-release (ignore error if already exists)
+          curl --silent "$BASE_URL/repository/tags" \
+            -X POST "${HEADERS[@]}" \
+            -d "{\"tag_name\":\"${RELEASE_TAG}\",\"ref\":\"main\"}" || true
+
+          # 2. Create Release
+          curl --fail-with-body --silent --show-error \
+            "$BASE_URL/releases" \
+            -X POST "${HEADERS[@]}" \
+            -d "{\"name\":\"${RELEASE_TAG}\",\"tag_name\":\"${RELEASE_TAG}\",\"description\":\"Tag: ${TAG}\"}"
+
+          # 3. Upload MSIX via Generic Packages API
+          MSIX_FILE=$(find msix-out -name "*.msix" | head -1)
+          FILE_NAME="kasir-pintar-dashboard-${TAG}.msix"
+          curl --fail-with-body --silent --show-error \
+            --request PUT \
+            -H "PRIVATE-TOKEN: ${{ secrets.RELEASE_GITLAB_TOKEN }}" \
+            --upload-file "$MSIX_FILE" \
+            "$BASE_URL/packages/generic/windows-msix/${RELEASE_TAG}/${FILE_NAME}"
+
+          # 4. Link package to Release
+          DIRECT_URL="https://gitlab.kpntr.com/api/v4/projects/${PROJECT_ID}/packages/generic/windows-msix/${RELEASE_TAG}/${FILE_NAME}"
+          curl --fail-with-body --silent --show-error \
+            "$BASE_URL/releases/${RELEASE_TAG}/assets/links" \
+            -X POST "${HEADERS[@]}" \
+            -d "{\"name\":\"${FILE_NAME}\",\"url\":\"${DIRECT_URL}\",\"link_type\":\"package\"}"
+
+          echo "✅ https://gitlab.kpntr.com/alan/windows-release/-/releases/${RELEASE_TAG}"
+
+  # ── Build: macOS release pkg (Testflight) ────────────────────────────────────
+
+  build-macos-release:
+    needs: [setup, test]
+    if: needs.setup.outputs.platform == 'macos' && needs.setup.outputs.env == 'release'
+    runs-on: macos-latest
+    environment: kasirpintar-dashboard
+    steps:
+      - name: Checkout from GitLab
+        run: |
+          git clone --depth 1 --branch ${{ needs.setup.outputs.tag }} \
+            https://oauth2:${{ secrets.GITLAB_ACCESS_TOKEN }}@${{ secrets.GITLAB_BASE_URL }}/${{ secrets.GITLAB_ORG }}/kasirpintar_dashboard.git .
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get --no-example
+
+      - name: Restore App Store Connect API key
+        run: |
+          KEY_ID="${{ secrets.APPSTORE_API_KEY_ID }}"
+          KEY_PATH="$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8"
+          mkdir -p "$(dirname $KEY_PATH)"
+          echo "${{ secrets.APPSTORE_API_KEY_P8_BASE64 }}" | base64 -d > "$KEY_PATH"
+
+      - name: Bump version in pubspec.yaml
+        run: |
+          VERSION_NAME="${{ needs.setup.outputs.version_name }}"
+          VERSION_CODE="${{ needs.setup.outputs.version_code }}"
+          sed -i '' "s/^version: .*/version: ${VERSION_NAME}+${VERSION_CODE}/" pubspec.yaml
+
+      - name: Install CocoaPods dependencies
+        run: |
+          cd macos && pod install --repo-update
+
+      - name: Prepare & archive macOS (App Store Connect)
+        run: |
+          KEY_ID="${{ secrets.APPSTORE_API_KEY_ID }}"
+          KEY_PATH="$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8"
+          rm -rf build/macos/archive build/macos/export
+          mkdir -p build/macos/export
+          flutter build macos --config-only --release
+          xcodebuild archive \
+            -workspace macos/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -destination "generic/platform=macOS" \
+            -archivePath build/macos/archive/KasirPintarDashboard.xcarchive \
+            ARCHS="$(uname -m)" \
+            -quiet \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY_PATH" \
+            -authenticationKeyID "$KEY_ID" \
+            -authenticationKeyIssuerID "${{ secrets.APPSTORE_API_ISSUER_ID }}"
+
+      - name: Export macOS pkg and verify signature
+        run: |
+          KEY_ID="${{ secrets.APPSTORE_API_KEY_ID }}"
+          KEY_PATH="$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8"
+          xcodebuild -exportArchive \
+            -archivePath build/macos/archive/KasirPintarDashboard.xcarchive \
+            -exportPath build/macos/export \
+            -exportOptionsPlist ExportOptions-macos.plist \
+            -quiet \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY_PATH" \
+            -authenticationKeyID "$KEY_ID" \
+            -authenticationKeyIssuerID "${{ secrets.APPSTORE_API_ISSUER_ID }}"
+          pkgutil --check-signature "build/macos/export/Kasir Pintar Dashboard.pkg"
+
+      - name: Upload macOS pkg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-release-pkg
+          path: build/macos/export/*.pkg
+          retention-days: 7
+
+  # ── Deploy: macOS release pkg → Testflight ───────────────────────────────────
+
+  deploy-macos-release-testflight:
+    needs: [setup, build-macos-release]
+    if: needs.setup.outputs.platform == 'macos' && needs.setup.outputs.env == 'release'
+    runs-on: macos-latest
+    environment: kasirpintar-dashboard
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-release-pkg
+          path: pkg-out/
+
+      - name: Restore App Store Connect API key
+        run: |
+          KEY_ID="${{ secrets.APPSTORE_API_KEY_ID }}"
+          KEY_PATH="$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8"
+          mkdir -p "$(dirname $KEY_PATH)"
+          echo "${{ secrets.APPSTORE_API_KEY_P8_BASE64 }}" | base64 -d > "$KEY_PATH"
+
+      - name: Upload to Testflight via altool
+        run: |
+          PKG=$(find pkg-out -name "*.pkg" | head -1)
+          xcrun altool --upload-app \
+            --type macos \
+            -f "$PKG" \
+            --apiKey  "${{ secrets.APPSTORE_API_KEY_ID }}" \
+            --apiIssuer "${{ secrets.APPSTORE_API_ISSUER_ID }}"
+
+  # ── Build: iOS release IPA (App Store) ───────────────────────────────────────
+
+  build-ios-release:
+    needs: [setup, test]
+    if: needs.setup.outputs.platform == 'ios' && needs.setup.outputs.env == 'release'
+    runs-on: macos-latest
+    environment: kasirpintar-dashboard
+    steps:
+      - name: Checkout from GitLab
+        run: |
+          git clone --depth 1 --branch ${{ needs.setup.outputs.tag }} \
+            https://oauth2:${{ secrets.GITLAB_ACCESS_TOKEN }}@${{ secrets.GITLAB_BASE_URL }}/${{ secrets.GITLAB_ORG }}/kasirpintar_dashboard.git .
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get --no-example
+
+      - name: Restore App Store Connect API key
+        run: |
+          KEY_ID="${{ secrets.APPSTORE_API_KEY_ID }}"
+          KEY_PATH="$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8"
+          mkdir -p "$(dirname $KEY_PATH)"
+          echo "${{ secrets.APPSTORE_API_KEY_P8_BASE64 }}" | base64 -d > "$KEY_PATH"
+
+      - name: Bump version in pubspec.yaml
+        run: |
+          VERSION_NAME="${{ needs.setup.outputs.version_name }}"
+          VERSION_CODE="${{ needs.setup.outputs.version_code }}"
+          sed -i '' "s/^version: .*/version: ${VERSION_NAME}+${VERSION_CODE}/" pubspec.yaml
+
+      - name: Install CocoaPods dependencies
+        run: |
+          cd ios && pod install --repo-update
+
+      - name: Archive iOS (release / App Store Connect)
+        run: |
+          KEY_ID="${{ secrets.APPSTORE_API_KEY_ID }}"
+          KEY_PATH="$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8"
+          flutter build ios --config-only --release
+          xcodebuild archive \
+            -workspace ios/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath build/ios/archive/Runner.xcarchive \
+            -quiet \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY_PATH" \
+            -authenticationKeyID "$KEY_ID" \
+            -authenticationKeyIssuerID "${{ secrets.APPSTORE_API_ISSUER_ID }}"
+
+      - name: Export iOS IPA (App Store Connect)
+        run: |
+          KEY_ID="${{ secrets.APPSTORE_API_KEY_ID }}"
+          KEY_PATH="$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8"
+          # ExportOptions-ios-adhoc.plist = ad-hoc; for App Store use app-store-connect method.
+          # shortcut: reuses ExportOptions-ios-adhoc.plist method=ad-hoc for archive export;
+          #           altool below uploads the IPA directly to App Store Connect / Testflight.
+          xcodebuild -exportArchive \
+            -archivePath build/ios/archive/Runner.xcarchive \
+            -exportPath build/ios/ipa \
+            -exportOptionsPlist ExportOptions-ios-adhoc.plist \
+            -quiet \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KEY_PATH" \
+            -authenticationKeyID "$KEY_ID" \
+            -authenticationKeyIssuerID "${{ secrets.APPSTORE_API_ISSUER_ID }}"
+
+      - name: Upload iOS release IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-release-ipa
+          path: build/ios/ipa/*.ipa
+          retention-days: 7
+
+  # ── Deploy: iOS release IPA → Testflight ─────────────────────────────────────
+
+  deploy-ios-release-testflight:
+    needs: [setup, build-ios-release]
+    if: needs.setup.outputs.platform == 'ios' && needs.setup.outputs.env == 'release'
+    runs-on: macos-latest
+    environment: kasirpintar-dashboard
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-release-ipa
+          path: ipa-out/
+
+      - name: Restore App Store Connect API key
+        run: |
+          KEY_ID="${{ secrets.APPSTORE_API_KEY_ID }}"
+          KEY_PATH="$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8"
+          mkdir -p "$(dirname $KEY_PATH)"
+          echo "${{ secrets.APPSTORE_API_KEY_P8_BASE64 }}" | base64 -d > "$KEY_PATH"
+
+      - name: Upload to Testflight via altool
+        run: |
+          IPA=$(find ipa-out -name "*.ipa" | head -1)
+          xcrun altool --upload-app \
+            --type ios \
+            -f "$IPA" \
+            --apiKey  "${{ secrets.APPSTORE_API_KEY_ID }}" \
+            --apiIssuer "${{ secrets.APPSTORE_API_ISSUER_ID }}"
+
+  # ── Build: Windows release MSIX ──────────────────────────────────────────────
+
+  build-windows-release:
+    needs: [setup, test]
+    if: needs.setup.outputs.platform == 'windows' && needs.setup.outputs.env == 'release'
+    runs-on: windows-latest
+    environment: kasirpintar-dashboard
+    steps:
+      - name: Checkout from GitLab
+        shell: bash
+        run: |
+          git clone --depth 1 --branch ${{ needs.setup.outputs.tag }} \
+            https://oauth2:${{ secrets.GITLAB_ACCESS_TOKEN }}@${{ secrets.GITLAB_BASE_URL }}/${{ secrets.GITLAB_ORG }}/kasirpintar_dashboard.git .
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get --no-example
+
+      - name: Restore PFX certificate
+        shell: pwsh
+        run: |
+          $bytes = [Convert]::FromBase64String("${{ secrets.WINDOWS_CERT_PFX_BASE64 }}")
+          [IO.File]::WriteAllBytes("$env:USERPROFILE\kaspin.pfx", $bytes)
+
+      - name: Bump version in pubspec.yaml
+        shell: bash
+        run: |
+          VERSION_NAME="${{ needs.setup.outputs.version_name }}"
+          VERSION_CODE="${{ needs.setup.outputs.version_code }}"
+          sed -i "s/^version: .*/version: ${VERSION_NAME}+${VERSION_CODE}/" pubspec.yaml
+
+      - name: Build Windows release MSIX
+        shell: pwsh
+        run: |
+          flutter build windows --release
+          flutter pub run msix:create `
+            --store `
+            --certificate-path "$env:USERPROFILE\kaspin.pfx" `
+            --certificate-password "${{ secrets.WINDOWS_CERT_PASSWORD }}" `
+            --logo-path "assets/images/logo_app.png" `
+            --publisher-display-name "PT KASIR PINTAR INTERNASIONAL" `
+            --publisher "CN=CB035A2C-7F6B-46A1-8042-42B86FFE7F03" `
+            --app-uri-handler-hosts kpntr.link `
+            --protocol-activation https,kaspindashboard
+
+      - name: Upload Windows release MSIX
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release-msix
+          path: build/**/*.msix
+          retention-days: 30
+
+  # ── Deploy: Windows release MSIX → Personal GitLab Release ───────────────────
+
+  deploy-windows-release-gitlab:
+    needs: [setup, build-windows-release]
+    if: needs.setup.outputs.platform == 'windows' && needs.setup.outputs.env == 'release'
+    runs-on: ubuntu-latest
+    environment: kasirpintar-dashboard
+    env:
+      TAG:        ${{ needs.setup.outputs.tag }}
+      RELEASE_TAG: kp-dashboard-${{ needs.setup.outputs.tag }}
+      PROJECT_ID: "157"
+      BASE_URL:   https://gitlab.kpntr.com/api/v4/projects/157
+      VERSION_NAME: ${{ needs.setup.outputs.version_name }}
+      VERSION_CODE: ${{ needs.setup.outputs.version_code }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-release-msix
+          path: msix-out/
+
+      - name: Create GitLab tag + Release and upload MSIX
+        run: |
+          HEADERS=(-H "PRIVATE-TOKEN: ${{ secrets.RELEASE_GITLAB_TOKEN }}" -H "Content-Type: application/json")
+
+          # 1. Create tag in alan/windows-release (ignore error if already exists)
+          curl --silent "$BASE_URL/repository/tags" \
+            -X POST "${HEADERS[@]}" \
+            -d "{\"tag_name\":\"${RELEASE_TAG}\",\"ref\":\"main\"}" || true
+
+          # 2. Create Release
+          curl --fail-with-body --silent --show-error \
+            "$BASE_URL/releases" \
+            -X POST "${HEADERS[@]}" \
+            -d "{\"name\":\"v${VERSION_NAME} (${VERSION_CODE})\",\"tag_name\":\"${RELEASE_TAG}\",\"description\":\"Tag: ${TAG} | Build: ${VERSION_CODE}\"}"
+
+          # 3. Upload MSIX
+          MSIX_FILE=$(find msix-out -name "*.msix" | head -1)
+          FILE_NAME="kasir-pintar-dashboard-${TAG}.msix"
+          curl --fail-with-body --silent --show-error \
+            --request PUT \
+            -H "PRIVATE-TOKEN: ${{ secrets.RELEASE_GITLAB_TOKEN }}" \
+            --upload-file "$MSIX_FILE" \
+            "$BASE_URL/packages/generic/windows-msix/${RELEASE_TAG}/${FILE_NAME}"
+
+          # 4. Link package to Release
+          DIRECT_URL="https://gitlab.kpntr.com/api/v4/projects/${PROJECT_ID}/packages/generic/windows-msix/${RELEASE_TAG}/${FILE_NAME}"
+          curl --fail-with-body --silent --show-error \
+            "$BASE_URL/releases/${RELEASE_TAG}/assets/links" \
+            -X POST "${HEADERS[@]}" \
+            -d "{\"name\":\"${FILE_NAME}\",\"url\":\"${DIRECT_URL}\",\"link_type\":\"package\"}"
+
+          echo "✅ https://gitlab.kpntr.com/alan/windows-release/-/releases/${RELEASE_TAG}"
