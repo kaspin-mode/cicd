@@ -414,6 +414,8 @@ jobs:
 
       - name: Build Windows debug MSIX
         shell: pwsh
+        env:
+          CMAKE_GENERATOR: "Visual Studio 17 2022"
         run: |
           flutter build windows --debug
           flutter pub run msix:create `
@@ -812,6 +814,8 @@ jobs:
 
       - name: Build Windows release MSIX
         shell: pwsh
+        env:
+          CMAKE_GENERATOR: "Visual Studio 17 2022"
         run: |
           flutter build windows --release
           flutter pub run msix:create `
