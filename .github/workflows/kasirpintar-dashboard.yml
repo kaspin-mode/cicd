@@ -417,13 +417,13 @@ jobs:
           Write-Host "Real cmake: $realCmake"
           $wrapperDir = Join-Path $env:RUNNER_TEMP "cmake_wrapper"
           New-Item -ItemType Directory -Force -Path $wrapperDir | Out-Null
-          @"
-@echo off
-setlocal EnableDelayedExpansion
-set "allargs=%*"
-set "allargs=!allargs:Visual Studio 16 2019=Visual Studio 17 2022!"
-"$realCmake" !allargs!
-"@ | Set-Content -Path "$wrapperDir\cmake.cmd" -Encoding ascii
+          @(
+            '@echo off'
+            'setlocal EnableDelayedExpansion'
+            'set "allargs=%*"'
+            'if defined allargs set "allargs=!allargs:Visual Studio 16 2019=Visual Studio 17 2022!"'
+            "`"$realCmake`" !allargs!"
+          ) | Set-Content -Path "$wrapperDir\cmake.cmd" -Encoding ascii
           "$wrapperDir" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           Write-Host "cmake wrapper installed at $wrapperDir"
 
@@ -829,13 +829,13 @@ set "allargs=!allargs:Visual Studio 16 2019=Visual Studio 17 2022!"
           Write-Host "Real cmake: $realCmake"
           $wrapperDir = Join-Path $env:RUNNER_TEMP "cmake_wrapper"
           New-Item -ItemType Directory -Force -Path $wrapperDir | Out-Null
-          @"
-@echo off
-setlocal EnableDelayedExpansion
-set "allargs=%*"
-set "allargs=!allargs:Visual Studio 16 2019=Visual Studio 17 2022!"
-"$realCmake" !allargs!
-"@ | Set-Content -Path "$wrapperDir\cmake.cmd" -Encoding ascii
+          @(
+            '@echo off'
+            'setlocal EnableDelayedExpansion'
+            'set "allargs=%*"'
+            'if defined allargs set "allargs=!allargs:Visual Studio 16 2019=Visual Studio 17 2022!"'
+            "`"$realCmake`" !allargs!"
+          ) | Set-Content -Path "$wrapperDir\cmake.cmd" -Encoding ascii
           "$wrapperDir" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           Write-Host "cmake wrapper installed at $wrapperDir"
 
