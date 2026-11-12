@@ -264,9 +264,25 @@ jobs:
           echo "Installed provisioning profile UUID: $PP_UUID"
           echo "PP_UUID=${PP_UUID}" >> $GITHUB_ENV
 
+      - name: Cache CocoaPods
+        uses: actions/cache@v4
+        with:
+          path: |
+            ios/Pods
+            ~/.cocoapods
+          key: pods-${{ hashFiles('ios/Podfile.lock') }}
+          restore-keys: pods-
+
+      - name: Cache Xcode DerivedData
+        uses: actions/cache@v4
+        with:
+          path: build/ios/DerivedData
+          key: derived-data-ios-${{ hashFiles('ios/Podfile.lock') }}-${{ hashFiles('**/*.dart') }}
+          restore-keys: derived-data-ios-${{ hashFiles('ios/Podfile.lock') }}-
+
       - name: Install CocoaPods dependencies
         run: |
-          cd ios && pod install --repo-update
+          cd ios && pod install
 
       - name: Archive iOS (debug / ad-hoc)
         run: |
@@ -279,6 +295,8 @@ jobs:
             -configuration Release \
             -destination "generic/platform=iOS" \
             -archivePath build/ios/archive/Runner.xcarchive \
+            -derivedDataPath build/ios/DerivedData \
+            -jobs $(sysctl -n hw.ncpu) \
             -quiet \
             -allowProvisioningUpdates \
             -authenticationKeyPath "$KEY_PATH" \
@@ -637,9 +655,25 @@ jobs:
           VERSION_CODE="${{ needs.setup.outputs.version_code }}"
           sed -i '' "s/^version: .*/version: ${VERSION_NAME}+${VERSION_CODE}/" pubspec.yaml
 
+      - name: Cache CocoaPods
+        uses: actions/cache@v4
+        with:
+          path: |
+            ios/Pods
+            ~/.cocoapods
+          key: pods-${{ hashFiles('ios/Podfile.lock') }}
+          restore-keys: pods-
+
+      - name: Cache Xcode DerivedData
+        uses: actions/cache@v4
+        with:
+          path: build/ios/DerivedData
+          key: derived-data-ios-${{ hashFiles('ios/Podfile.lock') }}-${{ hashFiles('**/*.dart') }}
+          restore-keys: derived-data-ios-${{ hashFiles('ios/Podfile.lock') }}-
+
       - name: Install CocoaPods dependencies
         run: |
-          cd ios && pod install --repo-update
+          cd ios && pod install
 
       - name: Archive iOS (release / App Store Connect)
         run: |
@@ -652,6 +686,8 @@ jobs:
             -configuration Release \
             -destination "generic/platform=iOS" \
             -archivePath build/ios/archive/Runner.xcarchive \
+            -derivedDataPath build/ios/DerivedData \
+            -jobs $(sysctl -n hw.ncpu) \
             -quiet \
             -allowProvisioningUpdates \
             -authenticationKeyPath "$KEY_PATH" \
