@@ -236,6 +236,34 @@ jobs:
           mkdir -p "$(dirname $KEY_PATH)"
           echo "${{ secrets.APPSTORE_API_KEY_P8_BASE64 }}" | base64 -d > "$KEY_PATH"
 
+      - name: Import iOS distribution certificate into Keychain
+        run: |
+          # Decode P12 cert and provisioning profile from secrets
+          echo "${{ secrets.IOS_DIST_CERT_P12_BASE64 }}" | base64 -d > /tmp/dist.p12
+          echo "${{ secrets.IOS_ADHOC_PROFILE_BASE64 }}" | base64 -d > /tmp/adhoc.mobileprovision
+
+          # Create a temporary keychain and import the cert
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASS="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security import /tmp/dist.p12 \
+            -k "$KEYCHAIN_PATH" \
+            -P "${{ secrets.IOS_DIST_CERT_P12_PASSWORD }}" \
+            -A -t cert -f pkcs12
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+          # Install provisioning profile
+          PP_UUID=$(security cms -D -i /tmp/adhoc.mobileprovision | \
+            plutil -extract UUID xml1 -o - - | \
+            sed -n 's/.*<string>\(.*\)<\/string>.*/\1/p')
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp /tmp/adhoc.mobileprovision \
+            "$HOME/Library/MobileDevice/Provisioning Profiles/${PP_UUID}.mobileprovision"
+          echo "Installed provisioning profile UUID: $PP_UUID"
+          echo "PP_UUID=${PP_UUID}" >> $GITHUB_ENV
+
       - name: Install CocoaPods dependencies
         run: |
           cd ios && pod install --repo-update
@@ -252,7 +280,6 @@ jobs:
             -destination "generic/platform=iOS" \
             -archivePath build/ios/archive/Runner.xcarchive \
             -quiet \
-            -allowProvisioningUpdates \
             -authenticationKeyPath "$KEY_PATH" \
             -authenticationKeyID "$KEY_ID" \
             -authenticationKeyIssuerID "${{ secrets.APPSTORE_API_ISSUER_ID }}"
@@ -261,12 +288,40 @@ jobs:
         run: |
           KEY_ID="${{ secrets.APPSTORE_API_KEY_ID }}"
           KEY_PATH="$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8"
+          # Write an ExportOptions plist with manual signing so the runner's
+          # locally-imported cert and profile are used (no cloud signing needed).
+          cat > /tmp/ExportOptions-ios-adhoc-manual.plist << 'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>ad-hoc</string>
+            <key>destination</key>
+            <string>export</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>teamID</key>
+            <string>JQBW9ZU72N</string>
+            <key>signingCertificate</key>
+            <string>iPhone Distribution</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>id.kasirpintar.dashboard</key>
+              <string>${{ secrets.IOS_ADHOC_PROFILE_NAME }}</string>
+            </dict>
+            <key>uploadSymbols</key>
+            <true/>
+            <key>thinning</key>
+            <string>&lt;none&gt;</string>
+          </dict>
+          </plist>
+          PLIST
           xcodebuild -exportArchive \
             -archivePath build/ios/archive/Runner.xcarchive \
             -exportPath build/ios/ipa \
-            -exportOptionsPlist ExportOptions-ios-adhoc.plist \
+            -exportOptionsPlist /tmp/ExportOptions-ios-adhoc-manual.plist \
             -quiet \
-            -allowProvisioningUpdates \
             -authenticationKeyPath "$KEY_PATH" \
             -authenticationKeyID "$KEY_ID" \
             -authenticationKeyIssuerID "${{ secrets.APPSTORE_API_ISSUER_ID }}"
@@ -543,6 +598,30 @@ jobs:
           mkdir -p "$(dirname $KEY_PATH)"
           echo "${{ secrets.APPSTORE_API_KEY_P8_BASE64 }}" | base64 -d > "$KEY_PATH"
 
+      - name: Import iOS distribution certificate into Keychain
+        run: |
+          echo "${{ secrets.IOS_DIST_CERT_P12_BASE64 }}" | base64 -d > /tmp/dist.p12
+          echo "${{ secrets.IOS_APPSTORE_PROFILE_BASE64 }}" | base64 -d > /tmp/appstore.mobileprovision
+
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASS="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+          security import /tmp/dist.p12 \
+            -k "$KEYCHAIN_PATH" \
+            -P "${{ secrets.IOS_DIST_CERT_P12_PASSWORD }}" \
+            -A -t cert -f pkcs12
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+          PP_UUID=$(security cms -D -i /tmp/appstore.mobileprovision | \
+            plutil -extract UUID xml1 -o - - | \
+            sed -n 's/.*<string>\(.*\)<\/string>.*/\1/p')
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp /tmp/appstore.mobileprovision \
+            "$HOME/Library/MobileDevice/Provisioning Profiles/${PP_UUID}.mobileprovision"
+          echo "Installed provisioning profile UUID: $PP_UUID"
+
       - name: Bump version in pubspec.yaml
         run: |
           VERSION_NAME="${{ needs.setup.outputs.version_name }}"
@@ -565,7 +644,6 @@ jobs:
             -destination "generic/platform=iOS" \
             -archivePath build/ios/archive/Runner.xcarchive \
             -quiet \
-            -allowProvisioningUpdates \
             -authenticationKeyPath "$KEY_PATH" \
             -authenticationKeyID "$KEY_ID" \
             -authenticationKeyIssuerID "${{ secrets.APPSTORE_API_ISSUER_ID }}"
@@ -574,15 +652,38 @@ jobs:
         run: |
           KEY_ID="${{ secrets.APPSTORE_API_KEY_ID }}"
           KEY_PATH="$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8"
-          # ExportOptions-ios-adhoc.plist = ad-hoc; for App Store use app-store-connect method.
-          # shortcut: reuses ExportOptions-ios-adhoc.plist method=ad-hoc for archive export;
-          #           altool below uploads the IPA directly to App Store Connect / Testflight.
+          cat > /tmp/ExportOptions-ios-appstore-manual.plist << 'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>destination</key>
+            <string>export</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>teamID</key>
+            <string>JQBW9ZU72N</string>
+            <key>signingCertificate</key>
+            <string>iPhone Distribution</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>id.kasirpintar.dashboard</key>
+              <string>${{ secrets.IOS_APPSTORE_PROFILE_NAME }}</string>
+            </dict>
+            <key>uploadSymbols</key>
+            <true/>
+            <key>manageAppVersionAndBuildNumber</key>
+            <false/>
+          </dict>
+          </plist>
+          PLIST
           xcodebuild -exportArchive \
             -archivePath build/ios/archive/Runner.xcarchive \
             -exportPath build/ios/ipa \
-            -exportOptionsPlist ExportOptions-ios-adhoc.plist \
+            -exportOptionsPlist /tmp/ExportOptions-ios-appstore-manual.plist \
             -quiet \
-            -allowProvisioningUpdates \
             -authenticationKeyPath "$KEY_PATH" \
             -authenticationKeyID "$KEY_ID" \
             -authenticationKeyIssuerID "${{ secrets.APPSTORE_API_ISSUER_ID }}"
