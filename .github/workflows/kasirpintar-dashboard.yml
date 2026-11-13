@@ -403,6 +403,34 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Configure Git auth and dependency overrides for Windows
+        shell: pwsh
+        run: |
+          git config --global url."https://oauth2:${{ secrets.GITLAB_ACCESS_TOKEN }}@${{ secrets.GITLAB_BASE_URL }}/".insteadOf "https://${{ secrets.GITLAB_BASE_URL }}/"
+
+          $lines = @(
+            'dependency_overrides:'
+            '  cloud_firestore:'
+            '    git:'
+            '      url: https://${{ secrets.GITLAB_BASE_URL }}/alan/dashboard'
+            '      ref: main'
+            '      path: plugins/cloud_firestore'
+            '  firebase_auth:'
+            '    git:'
+            '      url: https://${{ secrets.GITLAB_BASE_URL }}/alan/dashboard'
+            '      ref: main'
+            '      path: plugins/firebase_auth'
+            '  firebase_core:'
+            '    git:'
+            '      url: https://${{ secrets.GITLAB_BASE_URL }}/alan/dashboard'
+            '      ref: main'
+            '      path: plugins/firebase_core'
+          ) -join [Environment]::NewLine
+          $content = Get-Content pubspec.yaml -Raw
+          $content = $content -replace '(?m)^dependency_overrides:', $lines
+          Set-Content -Path pubspec.yaml -Value $content -NoNewline
+          git diff pubspec.yaml
+
       - name: Flutter pub get
         run: flutter pub get --no-example
 
@@ -793,6 +821,34 @@ jobs:
           flutter-version: '3.24.5'
           channel: stable
           cache: true
+
+      - name: Configure Git auth and dependency overrides for Windows
+        shell: pwsh
+        run: |
+          git config --global url."https://oauth2:${{ secrets.GITLAB_ACCESS_TOKEN }}@${{ secrets.GITLAB_BASE_URL }}/".insteadOf "https://${{ secrets.GITLAB_BASE_URL }}/"
+
+          $lines = @(
+            'dependency_overrides:'
+            '  cloud_firestore:'
+            '    git:'
+            '      url: https://${{ secrets.GITLAB_BASE_URL }}/alan/dashboard'
+            '      ref: main'
+            '      path: plugins/cloud_firestore'
+            '  firebase_auth:'
+            '    git:'
+            '      url: https://${{ secrets.GITLAB_BASE_URL }}/alan/dashboard'
+            '      ref: main'
+            '      path: plugins/firebase_auth'
+            '  firebase_core:'
+            '    git:'
+            '      url: https://${{ secrets.GITLAB_BASE_URL }}/alan/dashboard'
+            '      ref: main'
+            '      path: plugins/firebase_core'
+          ) -join [Environment]::NewLine
+          $content = Get-Content pubspec.yaml -Raw
+          $content = $content -replace '(?m)^dependency_overrides:', $lines
+          Set-Content -Path pubspec.yaml -Value $content -NoNewline
+          git diff pubspec.yaml
 
       - name: Flutter pub get
         run: flutter pub get --no-example
