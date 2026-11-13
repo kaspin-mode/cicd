@@ -227,12 +227,12 @@ jobs:
           KEY_ID="${{ secrets.APPSTORE_API_KEY_ID }}"
           KEY_PATH="$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8"
           flutter build macos --config-only --debug
-          xcodebuild build \
+          xcodebuild archive \
             -workspace macos/Runner.xcworkspace \
             -scheme Runner \
             -configuration Debug \
-            -destination "platform=macOS" \
-            -derivedDataPath build/macos \
+            -destination "generic/platform=macOS" \
+            -archivePath build/macos/archive/Runner.xcarchive \
             -jobs $(sysctl -n hw.ncpu) \
             -quiet \
             -allowProvisioningUpdates \
@@ -242,6 +242,10 @@ jobs:
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="Apple Development" \
             PROVISIONING_PROFILE_SPECIFIER="${{ secrets.MACOS_DEV_PROFILE_NAME }}"
+
+          mkdir -p build/macos/Build/Products/Debug
+          APP_PATH=$(find build/macos/archive/Runner.xcarchive -name "*.app" | head -1)
+          cp -R "$APP_PATH" build/macos/Build/Products/Debug/
 
       - name: Upload macOS debug artifact
         uses: actions/upload-artifact@v4
