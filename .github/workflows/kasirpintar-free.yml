@@ -1,0 +1,396 @@
+# GitHub Actions workflow for kasirpintar-free.
+# Triggered by GitLab CI via repository_dispatch (event_type: kasirpintar-free).
+#
+# Environment: kasirpintar-free
+#   Environment Secrets (Settings → Environments → kasirpintar-free → Environment secrets):
+#     KEYSTORE_BASE64      - base64-encoded sertifikat.jks  (`base64 -i sertifikat.jks | pbcopy`)
+#     FIREBASE_APP_ID      - Firebase App ID (1:xxxx:android:xxxx)
+#
+#   Repository Secrets (Settings → Secrets and variables → Actions → Repository secrets):
+#     GITLAB_ACCESS_TOKEN  - GitLab token to clone kasir-pintar/kasirpintar_free (read_repository scope)
+#     FIREBASE_TOKEN       - Firebase CLI token (`firebase login:ci`)
+#     GITLAB_API_TOKEN     - GitLab token with `api` scope (to upload packages & create GitLab Release)
+#     SLACK_WEBHOOK_URL    - Slack Incoming Webhook URL for CI/CD notifications
+
+name: KasirPintar Free CI/CD
+
+on:
+  repository_dispatch:
+    types: [kasirpintar-free]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'GitLab tag (e.g. debug-20261110.1300 or 1.0.0+1 or internal-20261110)'
+        required: true
+
+jobs:
+
+  # ── Detect env from tag ──────────────────────────────────────────────────────
+
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.detect.outputs.tag }}
+      env: ${{ steps.detect.outputs.env }}
+      version_name: ${{ steps.detect.outputs.version_name }}
+      version_code: ${{ steps.detect.outputs.version_code }}
+    steps:
+      - id: detect
+        run: |
+          TAG="${{ github.event.client_payload.tag || inputs.tag }}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          if [[ "$TAG" =~ ^debug- ]]; then
+            echo "env=debug" >> $GITHUB_OUTPUT
+          elif [[ "$TAG" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\+([0-9]+)$ ]]; then
+            echo "env=release"                       >> $GITHUB_OUTPUT
+            echo "version_name=${BASH_REMATCH[1]}"  >> $GITHUB_OUTPUT
+            echo "version_code=${BASH_REMATCH[2]}"  >> $GITHUB_OUTPUT
+          elif [[ "$TAG" =~ ^internal- ]]; then
+            echo "env=release"                       >> $GITHUB_OUTPUT
+            echo "version_name=${TAG#internal-}"    >> $GITHUB_OUTPUT
+            echo "version_code=0"                   >> $GITHUB_OUTPUT
+          else
+            echo "env=unknown" >> $GITHUB_OUTPUT
+          fi
+
+  # ── Test ─────────────────────────────────────────────────────────────────────
+
+  test:
+    needs: setup
+    if: needs.setup.outputs.env != 'unknown'
+    runs-on: ubuntu-latest
+    environment: kasirpintar-free
+    outputs:
+      test_count: ${{ steps.stats.outputs.test_count }}
+      coverage: ${{ steps.stats.outputs.coverage }}
+    steps:
+      - name: Checkout from GitLab
+        run: |
+          git clone --depth 1 --branch ${{ needs.setup.outputs.tag }} \
+            https://oauth2:${{ secrets.GITLAB_ACCESS_TOKEN }}@${{ secrets.GITLAB_BASE_URL }}/${{ secrets.GITLAB_ORG }}/kasirpintar_free.git .
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Run unit tests
+        run: ./gradlew test jacocoTestReport
+
+      - name: Extract test stats
+        id: stats
+        if: always()
+        run: |
+          XML=$(find app/build/reports -name "*.xml" -path "*/test/*/TEST-*.xml" | head -1)
+          if [ -n "$XML" ]; then
+            TESTS=$(grep -h 'testsuite' "$XML" | grep -oP 'tests="\K[0-9]+' | head -1)
+            echo "test_count=${TESTS:-0}" >> $GITHUB_OUTPUT
+          else
+            echo "test_count=0" >> $GITHUB_OUTPUT
+          fi
+          JACOCO="app/build/reports/jacoco/jacocoTestReport/jacocoTestReport.xml"
+          if [ -f "$JACOCO" ]; then
+            COV=$(python3 -c "
+          import xml.etree.ElementTree as ET
+          tree = ET.parse('$JACOCO')
+          for c in tree.getroot().iter('counter'):
+              if c.get('type') == 'LINE':
+                  m, c2 = int(c.get('missed')), int(c.get('covered'))
+                  pct = round(c2*100/(m+c2), 1) if (m+c2) > 0 else 0
+                  print(pct)
+                  break
+          ")
+            echo "coverage=${COV:-0}" >> $GITHUB_OUTPUT
+          else
+            echo "coverage=0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: app/build/reports/
+          retention-days: 7
+
+      - name: Upload reports to GitLab Generic Packages
+        if: always()
+        run: |
+          TAG="${{ needs.setup.outputs.tag }}"
+          zip -r test-reports.zip app/build/reports/
+          curl --fail-with-body --silent --show-error \
+            --request PUT \
+            --header "PRIVATE-TOKEN: ${{ secrets.GITLAB_API_TOKEN }}" \
+            --upload-file test-reports.zip \
+            "https://${{ secrets.GITLAB_BASE_URL }}/api/v4/projects/${{ secrets.GITLAB_ORG }}%2Fkasirpintar_free/packages/generic/test-reports/${TAG}/test-reports.zip"
+
+      - name: Notify Slack — test failed
+        if: failure()
+        run: |
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"text\": \"<@U0CJ1CFSJ0Z> ❌ *KasirPintar Free* — Test Failed\",
+              \"attachments\": [{
+                \"color\": \"danger\",
+                \"fields\": [
+                  {\"title\": \"Tag\", \"value\": \"${{ needs.setup.outputs.tag }}\", \"short\": true},
+                  {\"title\": \"Job\", \"value\": \"test\", \"short\": true},
+                  {\"title\": \"Logs & Stacktrace\", \"value\": \"<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>\", \"short\": false}
+                ]
+              }]
+            }"
+
+  # ── Build debug APK ───────────────────────────────────────────────────────────
+
+  build-debug:
+    needs: [setup, test]
+    if: needs.setup.outputs.env == 'debug'
+    runs-on: ubuntu-latest
+    environment: kasirpintar-free
+    steps:
+      - name: Checkout from GitLab
+        run: |
+          git clone --depth 1 --branch ${{ needs.setup.outputs.tag }} \
+            https://oauth2:${{ secrets.GITLAB_ACCESS_TOKEN }}@${{ secrets.GITLAB_BASE_URL }}/${{ secrets.GITLAB_ORG }}/kasirpintar_free.git .
+
+      - name: Restore keystore
+        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > sertifikat.jks
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 7
+
+      - name: Notify Slack — build failed
+        if: failure()
+        run: |
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"text\": \"<@U0CJ1CFSJ0Z> ❌ *KasirPintar Free* — Build Failed (debug APK)\",
+              \"attachments\": [{
+                \"color\": \"danger\",
+                \"fields\": [
+                  {\"title\": \"Tag\", \"value\": \"${{ needs.setup.outputs.tag }}\", \"short\": true},
+                  {\"title\": \"Job\", \"value\": \"build-debug\", \"short\": true},
+                  {\"title\": \"Logs & Stacktrace\", \"value\": \"<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>\", \"short\": false}
+                ]
+              }]
+            }"
+
+  # ── Build release AAB ─────────────────────────────────────────────────────────
+
+  build-release:
+    needs: [setup, test]
+    if: needs.setup.outputs.env == 'release'
+    runs-on: ubuntu-latest
+    environment: kasirpintar-free
+    steps:
+      - name: Checkout from GitLab
+        run: |
+          git clone --depth 1 --branch ${{ needs.setup.outputs.tag }} \
+            https://oauth2:${{ secrets.GITLAB_ACCESS_TOKEN }}@${{ secrets.GITLAB_BASE_URL }}/${{ secrets.GITLAB_ORG }}/kasirpintar_free.git .
+
+      - name: Restore keystore
+        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > sertifikat.jks
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Build release AAB
+        run: |
+          ./gradlew bundleRelease \
+            -PversionName="${{ needs.setup.outputs.version_name }}" \
+            -PversionCode="${{ needs.setup.outputs.version_code }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-release
+          path: app/build/outputs/bundle/release/app-release.aab
+          retention-days: 30
+
+      - name: Notify Slack — build failed
+        if: failure()
+        run: |
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"text\": \"<@U0CJ1CFSJ0Z> ❌ *KasirPintar Free* — Build Failed (release AAB)\",
+              \"attachments\": [{
+                \"color\": \"danger\",
+                \"fields\": [
+                  {\"title\": \"Tag\", \"value\": \"${{ needs.setup.outputs.tag }}\", \"short\": true},
+                  {\"title\": \"Job\", \"value\": \"build-release\", \"short\": true},
+                  {\"title\": \"Logs & Stacktrace\", \"value\": \"<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>\", \"short\": false}
+                ]
+              }]
+            }"
+
+  # ── Deploy: Firebase App Distribution (debug) ─────────────────────────────────
+
+  deploy-firebase:
+    needs: [setup, test, build-debug]
+    if: needs.setup.outputs.env == 'debug'
+    runs-on: ubuntu-latest
+    environment: kasirpintar-free
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-debug
+
+      - uses: wzieba/Firebase-Distribution-Github-Action@v1
+        with:
+          appId: ${{ secrets.FIREBASE_APP_ID }}
+          token: ${{ secrets.FIREBASE_TOKEN }}
+          groups: Tech
+          file: app-debug.apk
+          releaseNotes: "Build from tag ${{ needs.setup.outputs.tag }}"
+
+      - name: Notify Slack — deploy failed
+        if: failure()
+        run: |
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"text\": \"<@U0CJ1CFSJ0Z> ❌ *KasirPintar Free* — Deploy Failed (Firebase)\",
+              \"attachments\": [{
+                \"color\": \"danger\",
+                \"fields\": [
+                  {\"title\": \"Tag\", \"value\": \"${{ needs.setup.outputs.tag }}\", \"short\": true},
+                  {\"title\": \"Job\", \"value\": \"deploy-firebase\", \"short\": true},
+                  {\"title\": \"Logs & Stacktrace\", \"value\": \"<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>\", \"short\": false}
+                ]
+              }]
+            }"
+
+      - name: Notify Slack — deploy succeeded
+        if: success()
+        run: |
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"text\": \"<@U0CJ1CFSJ0Z> ✅ *KasirPintar Free* — Deploy Succeeded (Firebase Debug)\",
+              \"attachments\": [{
+                \"color\": \"good\",
+                \"fields\": [
+                  {\"title\": \"Tag\", \"value\": \"${{ needs.setup.outputs.tag }}\", \"short\": true},
+                  {\"title\": \"Tests Passed\", \"value\": \"${{ needs.test.outputs.test_count }}\", \"short\": true},
+                  {\"title\": \"Code Coverage\", \"value\": \"${{ needs.test.outputs.coverage }}%\", \"short\": true},
+                  {\"title\": \"Distribution\", \"value\": \"Firebase App Distribution (group: Tech)\", \"short\": false},
+                  {\"title\": \"Run\", \"value\": \"<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>\", \"short\": false}
+                ]
+              }]
+            }"
+
+  # ── Deploy: GitLab Release (release) ─────────────────────────────────────────
+
+  deploy-gitlab-release:
+    needs: [setup, test, build-release]
+    if: needs.setup.outputs.env == 'release'
+    runs-on: ubuntu-latest
+    environment: kasirpintar-free
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-release
+
+      - name: Upload AAB to GitLab Generic Packages and Create Release
+        id: deploy
+        env:
+          VERSION_NAME: ${{ needs.setup.outputs.version_name }}
+          VERSION_CODE: ${{ needs.setup.outputs.version_code }}
+          TAG: ${{ needs.setup.outputs.tag }}
+          PROJECT_PATH: ${{ secrets.GITLAB_ORG }}%2Fkasirpintar_free
+        run: |
+          FILE_NAME="kasirpintar-free-${TAG}.aab"
+          cp app-release.aab "$FILE_NAME"
+
+          PACKAGE_URL="https://${{ secrets.GITLAB_BASE_URL }}/api/v4/projects/${PROJECT_PATH}/packages/generic/app-release/${TAG}/${FILE_NAME}"
+
+          # 1. Upload AAB to GitLab Generic Packages
+          curl --fail-with-body --silent --show-error \
+            --request PUT \
+            --header "PRIVATE-TOKEN: ${{ secrets.GITLAB_API_TOKEN }}" \
+            --upload-file "$FILE_NAME" \
+            "$PACKAGE_URL"
+
+          # 2. Create GitLab Release (ignore error if release already exists)
+          curl --silent --show-error \
+            --request POST \
+            --header "PRIVATE-TOKEN: ${{ secrets.GITLAB_API_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --data "{
+              \"name\": \"v${VERSION_NAME} (${VERSION_CODE})\",
+              \"tag_name\": \"${TAG}\",
+              \"description\": \"Release ${VERSION_NAME} (build ${VERSION_CODE})\"
+            }" \
+            "https://${{ secrets.GITLAB_BASE_URL }}/api/v4/projects/${PROJECT_PATH}/releases" || true
+
+          # 3. Link package to Release assets
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "PRIVATE-TOKEN: ${{ secrets.GITLAB_API_TOKEN }}" \
+            --header "Content-Type: application/json" \
+            --data "{
+              \"name\": \"${FILE_NAME}\",
+              \"url\": \"${PACKAGE_URL}\",
+              \"link_type\": \"package\"
+            }" \
+            "https://${{ secrets.GITLAB_BASE_URL }}/api/v4/projects/${PROJECT_PATH}/releases/${TAG}/assets/links"
+
+          RELEASE_URL="https://${{ secrets.GITLAB_BASE_URL }}/${{ secrets.GITLAB_ORG }}/kasirpintar_free/-/releases/${TAG}"
+          echo "release_url=${RELEASE_URL}" >> $GITHUB_OUTPUT
+
+      - name: Notify Slack — deploy failed
+        if: failure()
+        run: |
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"text\": \"<@U0CJ1CFSJ0Z> ❌ *KasirPintar Free* — Deploy Failed (GitLab Release)\",
+              \"attachments\": [{
+                \"color\": \"danger\",
+                \"fields\": [
+                  {\"title\": \"Tag\", \"value\": \"${{ needs.setup.outputs.tag }}\", \"short\": true},
+                  {\"title\": \"Job\", \"value\": \"deploy-gitlab-release\", \"short\": true},
+                  {\"title\": \"Logs & Stacktrace\", \"value\": \"<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>\", \"short\": false}
+                ]
+              }]
+            }"
+
+      - name: Notify Slack — deploy succeeded
+        if: success()
+        run: |
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"text\": \"<@U0CJ1CFSJ0Z> ✅ *KasirPintar Free* — Deploy Succeeded (GitLab Release)\",
+              \"attachments\": [{
+                \"color\": \"good\",
+                \"fields\": [
+                  {\"title\": \"Tag\", \"value\": \"${{ needs.setup.outputs.tag }}\", \"short\": true},
+                  {\"title\": \"Tests Passed\", \"value\": \"${{ needs.test.outputs.test_count }}\", \"short\": true},
+                  {\"title\": \"Code Coverage\", \"value\": \"${{ needs.test.outputs.coverage }}%\", \"short\": true},
+                  {\"title\": \"Deployment\", \"value\": \"<${{ steps.deploy.outputs.release_url }}|GitLab Release v${{ needs.setup.outputs.version_name }}>\", \"short\": false},
+                  {\"title\": \"Run\", \"value\": \"<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>\", \"short\": false}
+                ]
+              }]
+            }"
